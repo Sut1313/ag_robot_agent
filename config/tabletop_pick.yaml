@@ -1,0 +1,27 @@
+tabletop_pick:
+  ros_domain_id: 67
+  gz_partition: tabletop67
+  shared_dir: ${AGENT_ROOT}/runtime_data/tabletop_67
+  tabletop_ws: ${PIPER_TABLETOP_WS}
+  real_ws: ${PIPER_REAL_WS}
+  handeye_yaml: ${PIPER_TABLETOP_WS}/config/handeye_sim.yaml
+  object_name: wood_block
+  object_width_m: 0.04
+  object_yaw_rad: 0.28
+  opening_axis_max_error_deg: 15
+  max_candidates: 30
+  opening_down_min: -0.15
+  opening_down_max: 0.15
+  forward_z_min: -1.0
+  forward_z_max: -0.80
+  center_distance_max_m: 0.021
+  center_pull_xyz: 1.0
+  grasp_z_offset_m: 0.0235
+  max_frame_age_s: 20
+  candidate_wait_s: 120
+  min_lift_m: 0.06
+  hold_check_s: 60
+  startup_timeout_s: 90
+  execution_timeout_s: 300
+  max_execution_attempts: 2
+  max_frame_prechecks: 4

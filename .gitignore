@@ -1,0 +1,32 @@
+# Local credentials and per-machine configuration
+.env
+.env.*
+env.txt
+/config.local/
+*.pem
+*.key
+
+# Generated state and environments
+/logs/
+/runtime_data/
+*.log
+*.onnx
+*.pt
+*.pth
+*.mcap
+*.db3
+__pycache__/
+*.py[cod]
+/.pytest_cache/
+/.venv/
+/venv/
+*.tmp
+*.bak
+*.bak-*
+*.swp
+
+# Internal handoff notes and one-off data generation scripts
+/docs/任务交接报告.md
+/docs/施工方案.md
+/docs/取消接口设计.md
+/tests/make_*.py

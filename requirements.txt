@@ -1,0 +1,5 @@
+jpl-rosa==1.0.10
+langchain-openai==0.3.35
+python-dotenv==1.2.4
+PyYAML==6.0.1
+numpy==2.2.6

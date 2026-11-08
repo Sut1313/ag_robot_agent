@@ -1,0 +1,23 @@
+# piper_with_yolo_graspnet backend (Gazebo Harmonic).
+# This project has no /grasp_execute Trigger: lightweight_grasp_executor is a
+# one-shot node that runs on start, honours dry_run, and exits with 0/1.
+
+yolo_pick:
+  project_ws: ${PIPER_YOLO_SIM_PROJECT}
+  sim_ws: ${PIPER_YOLO_SIM_PROJECT}/gazebo_piper_pick_place
+  shared_dir: ${PIPER_YOLO_SIM_PROJECT}/shared_camera_data
+  sim_script: ${AGENT_ROOT}/scripts/start_yolo_sim.sh
+  moveit_script: ${AGENT_ROOT}/scripts/start_yolo_moveit.sh
+  executor_script: ${AGENT_ROOT}/scripts/run_yolo_executor.sh
+  graspnet_script: ${PIPER_YOLO_SIM_PROJECT}/graspnet-docker-camera.sh
+  result_file: pick_state.json
+  perception_mode: live
+  camera_pitch_offset: 1.047197551
+  sim_ready_timeout_s: 120
+  graspnet_ready_timeout_s: 60
+  moveit_ready_timeout_s: 40
+  moveit_settle_s: 10
+  # Optional local synthetic candidate generator for development.
+  candidate_script: null
+  candidate_refresh_s: 0
+  executor_timeout_s: 300

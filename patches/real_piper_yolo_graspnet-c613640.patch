@@ -1,0 +1,1625 @@
+diff --git a/graspnet-baseline/inference_from_camera.py b/graspnet-baseline/inference_from_camera.py
+index 2b87d8a..ff422d4 100755
+--- a/graspnet-baseline/inference_from_camera.py
++++ b/graspnet-baseline/inference_from_camera.py
+@@ -1498,12 +1498,9 @@ def main():
+                     latest_color_image = roi_overlay
+                     latest_precheck_image = precheck_img
+             else:
+-                result_img = render_result(gg, processed['scene_cloud'],
+-                                           processed['object_cloud'],
+-                                           processed['color_vis'],
+-                                           processed['object_stats'],
+-                                           grasp_validation)
+-                atomic_imwrite(os.path.join(cfgs.shared_dir, 'result.png'), result_img)
++                # Headless inference must not initialize Open3D's EGL renderer.
++                # The candidate CSV was already written above, so rendering is
++                # optional and must not prevent consumers from seeing grasps.
+                 atomic_imwrite(os.path.join(cfgs.shared_dir, 'result_color.png'),
+                                cv2.cvtColor(roi_overlay, cv2.COLOR_RGB2BGR))
+ 
+diff --git a/run_d435i_yolo_bridge.sh b/run_d435i_yolo_bridge.sh
+index 728260e..aeac922 100755
+--- a/run_d435i_yolo_bridge.sh
++++ b/run_d435i_yolo_bridge.sh
+@@ -11,6 +11,6 @@ fi
+ set -u
+ 
+ ros2 launch real_piper_yolo_graspnet d435i_yolo_graspnet_pipeline.launch.py \
+-  shared_dir:="${SCRIPT_DIR}/shared_camera_data" \
++  shared_dir:="${SHARED_DIR:-${SCRIPT_DIR}/shared_camera_data}" \
+   model_path:="${TABLETOP_YOLO_MODEL:-${SCRIPT_DIR}/../tabletop_yolov8seg/models/tabletop_yolov8s_seg_v2.onnx}" \
+   target_class:="${TARGET_CLASS:-cup}"
+diff --git a/run_graspnet_d435i.sh b/run_graspnet_d435i.sh
+index decbb70..139264f 100755
+--- a/run_graspnet_d435i.sh
++++ b/run_graspnet_d435i.sh
+@@ -4,7 +4,7 @@ set -euo pipefail
+ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ IMAGE_NAME="${IMAGE_NAME:-graspnet-baseline:20.04}"
+ MODE="${1:-gui}"
+-SHARED_DIR="${SCRIPT_DIR}/shared_camera_data"
++SHARED_DIR="${SHARED_DIR:-${SCRIPT_DIR}/shared_camera_data}"
+ SHARED_MOUNT="/shared_camera_data"
+ CHECKPOINT_PATH="${CHECKPOINT_PATH:-logs/log_rs/checkpoint.tar}"
+ MIN_DEPTH_M="${MIN_DEPTH_M:-0.15}"
+@@ -16,6 +16,19 @@ SAVE_DEBUG_OUTPUTS="${SAVE_DEBUG_OUTPUTS:-0}"
+ SAVE_DEBUG_EVERY="${SAVE_DEBUG_EVERY:-10}"
+ MAX_SAVED_DEBUG_FRAMES="${MAX_SAVED_DEBUG_FRAMES:-5}"
+ DOCKER_TTY_ARGS=()
++DOCKER_NAME_ARGS=()
++DOCKER_RESOURCE_ARGS=()
++if [[ -n "${GRASPNET_CONTAINER_NAME:-}" ]]; then
++  DOCKER_NAME_ARGS=(--name "${GRASPNET_CONTAINER_NAME}")
++fi
++if [[ -n "${GRASPNET_CPU_LIMIT:-}" ]]; then
++  DOCKER_RESOURCE_ARGS=(
++    --cpus "${GRASPNET_CPU_LIMIT}"
++    -e OMP_NUM_THREADS="${GRASPNET_OMP_THREADS:-4}"
++    -e MKL_NUM_THREADS="${GRASPNET_OMP_THREADS:-4}"
++    -e OPENBLAS_NUM_THREADS=1
++  )
++fi
+ if [[ -t 0 && -t 1 ]]; then
+   DOCKER_TTY_ARGS=(-it)
+ fi
+@@ -66,7 +79,7 @@ case "${MODE}" in
+       exit 1
+     fi
+     xhost +local:docker >/dev/null 2>&1 || true
+-    docker run --rm "${DOCKER_TTY_ARGS[@]}" \
++    docker run --rm "${DOCKER_TTY_ARGS[@]}" "${DOCKER_NAME_ARGS[@]}" "${DOCKER_RESOURCE_ARGS[@]}" \
+       --gpus 'all,"capabilities=compute,utility,graphics"' \
+       --ipc=host \
+       --network=host \
+@@ -86,7 +99,7 @@ case "${MODE}" in
+       "${common_args[@]}"
+     ;;
+   headless)
+-    docker run --rm \
++    docker run --rm "${DOCKER_NAME_ARGS[@]}" "${DOCKER_RESOURCE_ARGS[@]}" \
+       --gpus 'all,"capabilities=compute,utility,graphics"' \
+       --ipc=host \
+       --network=host \
+diff --git a/src/real_piper_perception/launch/grasp_execute.launch.py b/src/real_piper_perception/launch/grasp_execute.launch.py
+index bc2fa53..6994158 100644
+--- a/src/real_piper_perception/launch/grasp_execute.launch.py
++++ b/src/real_piper_perception/launch/grasp_execute.launch.py
+@@ -15,6 +15,7 @@ from launch import LaunchDescription
+ from launch.actions import DeclareLaunchArgument
+ from launch.substitutions import LaunchConfiguration
+ from launch_ros.actions import Node
++from launch_ros.parameter_descriptions import ParameterValue
+ 
+ # 包内 ssik 脚本绝对路径（launch 文件位于 <pkg_root>/launch/）。
+ # M6（fixed 2026-08-07）：abspath 不解析 symlink（symlink-install 下 __file__
+@@ -38,6 +39,7 @@ def generate_launch_description():
+     grasp_z_offset = LaunchConfiguration('grasp_z_offset')
+     gripper_margin = LaunchConfiguration('gripper_margin')
+     gripper_detect_threshold = LaunchConfiguration('gripper_detect_threshold')
++    gripper_backend = LaunchConfiguration('gripper_backend')
+     graspnet_6d_max_candidates = LaunchConfiguration('graspnet_6d_max_candidates')
+     candidate_frames = LaunchConfiguration('candidate_frames')
+     grasp_score_min = LaunchConfiguration('grasp_score_min')
+@@ -56,7 +58,17 @@ def generate_launch_description():
+     piper_analytic_ik_max_solution_plans = LaunchConfiguration(
+         'piper_analytic_ik_max_solution_plans')
+     planning_time_precheck = LaunchConfiguration('planning_time_precheck')
++    precheck_lift = LaunchConfiguration('precheck_lift')
+     planning_time_exec = LaunchConfiguration('planning_time_exec')
++    enable_sim_lift = LaunchConfiguration('enable_sim_lift')
++    skip_final_home = LaunchConfiguration('skip_final_home')
++    sim_min_hold_width = LaunchConfiguration('sim_min_hold_width')
++    sim_max_hold_width = LaunchConfiguration('sim_max_hold_width')
++    sim_home_on_failure = LaunchConfiguration('sim_home_on_failure')
++    pose_goal_box_m = LaunchConfiguration('pose_goal_box_m')
++    sim_pregrasp_opening_m = LaunchConfiguration('sim_pregrasp_opening_m')
++    enable_sim_place_service = LaunchConfiguration('enable_sim_place_service')
++    sim_release_height_m = LaunchConfiguration('sim_release_height_m')
+ 
+     return LaunchDescription([
+         # ⚠ scan_only 默认 true（安全默认：只预检不执行）。切 false 需现场二次确认！
+@@ -85,6 +97,9 @@ def generate_launch_description():
+         DeclareLaunchArgument('grasp_z_offset', default_value='0.02'),
+         DeclareLaunchArgument('gripper_margin', default_value='0.005'),
+         DeclareLaunchArgument('gripper_detect_threshold', default_value='0.01'),
++        DeclareLaunchArgument(
++            'gripper_backend', default_value='sdk',
++            description="'sdk' = Piper SDK (real), 'ros' = /gripper_controller (sim)"),
+         # I2 修复：默认候选数 1 → 50（真实 CSV 37 候选下 default=1 曾导致
+         # rank[0] 门控漂移即 tested=0、流程永不执行；节点侧另有上限 300 钳制）
+         DeclareLaunchArgument('graspnet_6d_max_candidates', default_value='150'),
+@@ -115,7 +130,35 @@ def generate_launch_description():
+             'piper_analytic_ik_max_solution_plans', default_value='6'),
+         # 2026-08-10 用户裁决：每段预检求解预算 0.5s（失败候选由 ~1.0s 减半）
+         DeclareLaunchArgument('planning_time_precheck', default_value='0.5'),
++        DeclareLaunchArgument('precheck_lift', default_value='false'),
+         DeclareLaunchArgument('planning_time_exec', default_value='10.0'),
++        DeclareLaunchArgument(
++            'enable_sim_lift', default_value='false',
++            description='Simulation only: lift 10 cm after a successful grasp'),
++        DeclareLaunchArgument(
++            'skip_final_home', default_value='false',
++            description='Debug only: leave the arm at the final pose'),
++        DeclareLaunchArgument(
++            'sim_min_hold_width', default_value='0.0',
++            description='Simulation ROS gripper minimum held width in metres'),
++        DeclareLaunchArgument(
++            'sim_max_hold_width', default_value='0.070',
++            description='Simulation ROS gripper maximum held width in metres'),
++        DeclareLaunchArgument(
++            'sim_home_on_failure', default_value='false',
++            description='Simulation only: return to zero after failed grasp'),
++        DeclareLaunchArgument(
++            'pose_goal_box_m', default_value='0.02',
++            description='MoveIt pose goal constraint box side length in metres'),
++        DeclareLaunchArgument(
++            'sim_pregrasp_opening_m', default_value='0.070',
++            description='Simulation only: opening before moving to grasp'),
++        DeclareLaunchArgument(
++            'enable_sim_place_service', default_value='false',
++            description='Simulation only: enable tabletop return-and-release service'),
++        DeclareLaunchArgument(
++            'sim_release_height_m', default_value='0.03',
++            description='Height above the grasp pose for simulated release'),
+ 
+         Node(
+             package='real_piper_perception',
+@@ -134,6 +177,7 @@ def generate_launch_description():
+                 'grasp_z_offset': grasp_z_offset,
+                 'gripper_margin': gripper_margin,
+                 'gripper_detect_threshold': gripper_detect_threshold,
++                'gripper_backend': gripper_backend,
+                 'graspnet_6d_max_candidates': graspnet_6d_max_candidates,
+                 'candidate_frames': candidate_frames,
+                 'grasp_score_min': grasp_score_min,
+@@ -147,7 +191,26 @@ def generate_launch_description():
+                 'piper_analytic_ik_max_solutions': piper_analytic_ik_max_solutions,
+                 'piper_analytic_ik_max_solution_plans': piper_analytic_ik_max_solution_plans,
+                 'planning_time_precheck': planning_time_precheck,
++                'precheck_lift': ParameterValue(precheck_lift, value_type=bool),
+                 'planning_time_exec': planning_time_exec,
++                'enable_sim_lift': ParameterValue(
++                    enable_sim_lift, value_type=bool),
++                'skip_final_home': ParameterValue(
++                    skip_final_home, value_type=bool),
++                'sim_min_hold_width': ParameterValue(
++                    sim_min_hold_width, value_type=float),
++                'sim_max_hold_width': ParameterValue(
++                    sim_max_hold_width, value_type=float),
++                'sim_home_on_failure': ParameterValue(
++                    sim_home_on_failure, value_type=bool),
++                'pose_goal_box_m': ParameterValue(
++                    pose_goal_box_m, value_type=float),
++                'sim_pregrasp_opening_m': ParameterValue(
++                    sim_pregrasp_opening_m, value_type=float),
++                'enable_sim_place_service': ParameterValue(
++                    enable_sim_place_service, value_type=bool),
++                'sim_release_height_m': ParameterValue(
++                    sim_release_height_m, value_type=float),
+             }],
+             output='screen',
+         ),
+diff --git a/src/real_piper_perception/package.xml b/src/real_piper_perception/package.xml
+index 140fd60..c6b8013 100644
+--- a/src/real_piper_perception/package.xml
++++ b/src/real_piper_perception/package.xml
+@@ -10,6 +10,7 @@
+   <buildtool_depend>ament_python</buildtool_depend>
+ 
+   <depend>rclpy</depend>
++  <depend>rcl_interfaces</depend>
+   <depend>sensor_msgs</depend>
+   <depend>std_srvs</depend>
+   <depend>std_msgs</depend>
+diff --git a/src/real_piper_perception/real_piper_perception/grasp_execute.py b/src/real_piper_perception/real_piper_perception/grasp_execute.py
+index 935f0fb..00682fd 100644
+--- a/src/real_piper_perception/real_piper_perception/grasp_execute.py
++++ b/src/real_piper_perception/real_piper_perception/grasp_execute.py
+@@ -53,6 +53,7 @@ MoveIt 调用为接口占位 + fail-closed（同 Task 6 策略），真实接线
+ 
+ from __future__ import annotations
+ 
++import os
+ import threading
+ import time
+ from typing import TYPE_CHECKING
+@@ -83,6 +84,14 @@ PARAM_DEFAULTS = {
+     'gripper_detect_threshold': 0.01,  # 判定阈值（米）
+     'lift_z': 0.10,                    # 抬升高度（米，基座系 Z 向上）
+     'planning_time_exec': 10.0,        # 执行段规划时间上限（秒）
++    # 'sdk': piper_sdk 直控（真机）；'ros': 发布 /gripper_controller 轨迹（仿真）
++    'gripper_backend': 'sdk',
++    # Simulation-only: after a successful close, lift to stage_poses['lift']
++    # and verify the gripper still holds. Real robot leaves this false.
++    'enable_sim_lift': False,
++    'sim_min_hold_width': 0.0,
++    'sim_max_hold_width': 0.070,
++    'sim_pregrasp_opening_m': 0.070,
+ }
+ 
+ # 执行序列阶段名（失败时返回的 stage 取值；成功/抓空为 ''）
+@@ -100,6 +109,16 @@ FEEDBACK_TOPIC = '/joint_states_feedback'
+ # 超时则用最近缓存（无数据 → None → 判定按失败处理）。
+ FEEDBACK_SETTLE_S = 0.5
+ 
++# The simulated gz_ros2_control gripper is much more damped than the real
++# PiPER: a full stroke takes ~4.5 s even though the trajectory asks for 2 s.
++# The real SDK path runs a 1 s, 200 Hz command loop; keep 0.8 s for it and
++# let the simulation wrapper raise this via GRASP_GRIPPER_SETTLE_S.
++try:
++    _ROS_GRIPPER_SETTLE_S = min(max(
++        float(os.environ.get('GRASP_GRIPPER_SETTLE_S', '0.8')), 0.0), 10.0)
++except ValueError:
++    _ROS_GRIPPER_SETTLE_S = 0.8
++
+ # 2026-08-21 真机抓空暴露：第一条新反馈可能只是闭合途中的瞬态
+ #（69.7→24.0→4.3mm）。业务判定必须等待一段连续稳定窗口，并在初判
+ # grasped 后再做一次保持复核，不能把“新反馈”等同于“稳定反馈”。
+@@ -225,6 +244,19 @@ class GraspExecutor:
+         self._piper = None  # SDK 直控惰性初始化（2026-08-07，参考 piper_sdk demo）
+         self._feedback_lock = threading.Lock()
+         self._feedback_sub = None
++        # ROS gripper backend (simulation): keep publishing the target so a
++        # position controller keeps applying the closing command.
++        self._gripper_backend = str(
++            self.params.get('gripper_backend', 'sdk')).strip().lower()
++        self._ros_gripper_target = None
++        self._ros_gripper_pub = None
++        self._ros_gripper_thread = None
++        self._ros_gripper_timer = None
++        self._ros_gripper_group = None
++        self._ros_last_published_target = None
++        self._ros_last_publish = 0.0
++        if self._gripper_backend == 'ros' and node is not None:
++            self._ensure_ros_gripper()
+         if node is not None:
+             self._setup_feedback_subscription()
+ 
+@@ -326,6 +358,25 @@ class GraspExecutor:
+         ``stable_tol_m`` 才算稳定。超时或无稳定窗口返回 None（fail-closed），
+         绝不退回闭合途中的首条瞬态或命令前旧缓存。
+         """
++        if self._gripper_backend == 'ros':
++            # Simulation: the topic is already a clean controller state. After
++            # the settle sleep in _gripper_set_width, the first new sample is
++            # the settled value; the strict real-hw stable window is unnecessary
++            # and can time out while the topic callback is being scheduled.
++            timeout_s = max(float(timeout_s), 0.0)
++            with self._feedback_lock:
++                entry_stamp = self._latest_gripper_stamp
++                latest = self._latest_gripper
++            deadline = time.monotonic() + timeout_s
++            while time.monotonic() < deadline:
++                with self._feedback_lock:
++                    stamp = self._latest_gripper_stamp
++                    value = self._latest_gripper
++                if (stamp > entry_stamp and value is not None
++                        and np.isfinite(value)):
++                    return float(value)
++                time.sleep(0.01)
++            return latest
+         timeout_s = max(float(timeout_s), 0.0)
+         stable_window_s = max(float(stable_window_s), 0.0)
+         stable_tol_m = max(float(stable_tol_m), 0.0)
+@@ -429,6 +480,8 @@ class GraspExecutor:
+             return False
+         # 1) 笛卡尔规划（失败 → 回退 OMPL 规划）
+         try:
++            self.move_group.set_max_velocity_scaling_factor(
++                float(self.params['velocity_scale']))
+             plan, fraction = self.move_group.compute_cartesian_path(
+                 [pose_msg], eef_step=CARTESIAN_EEF_STEP,
+                 jump_threshold=CARTESIAN_JUMP_THRESHOLD,
+@@ -443,10 +496,7 @@ class GraspExecutor:
+             return self._move_pose(pose)
+         # 2) 执行（失败不回退重试，返回 False）
+         try:
+-            self.move_group.set_max_velocity_scaling_factor(
+-                float(self.params['velocity_scale']))
+-            self.move_group.execute(plan)
+-            return True
++            return bool(self.move_group.execute(plan))
+         except Exception as exc:
+             self._log('warn', f'笛卡尔直线执行失败（{exc}）：不重试，fail-closed；'
+                               f'Task 9 干跑联调')
+@@ -471,19 +521,75 @@ class GraspExecutor:
+             return False
+         try:
+             self.move_group.set_planning_time(float(self.params['planning_time_exec']))
++            self.move_group.set_max_velocity_scaling_factor(
++                float(self.params['velocity_scale']))
+             self.move_group.set_start_state_to_current_state()
+             self.move_group.set_pose_target(pose_msg, end_effector_link=END_EFFECTOR_LINK)
+             plan = self.move_group.plan()
+             if plan is None:
+                 return False
+-            self.move_group.set_max_velocity_scaling_factor(
+-                float(self.params['velocity_scale']))
+             return bool(self.move_group.execute(plan))
+         except Exception as exc:
+             self._log('warn', f'MoveIt plan+execute 未接线或调用失败（{exc}）：'
+                               f'fail-closed；Task 9 干跑联调')
+             return False
+ 
++    def _ensure_ros_gripper(self) -> bool:
++        """Create the simulation gripper publisher + executor timer."""
++        if self._ros_gripper_pub is not None:
++            return True
++        if self.node is None:
++            self._log('warn', 'ROS gripper backend 需要 rclpy node')
++            return False
++        try:
++            from rclpy.callback_groups import ReentrantCallbackGroup
++            from trajectory_msgs.msg import JointTrajectory
++            topic = str(self.params.get(
++                'gripper_ros_topic', '/gripper_controller/joint_trajectory'))
++            self._ros_gripper_pub = self.node.create_publisher(
++                JointTrajectory, topic, 10)
++            # The service callback blocks the node's default MutuallyExclusive
++            # group while a flow runs, so the keep-alive timer must live in its
++            # own Reentrant group or it never fires.
++            self._ros_gripper_group = ReentrantCallbackGroup()
++            self._ros_gripper_timer = self.node.create_timer(
++                0.05, self._ros_gripper_timer_cb,
++                callback_group=self._ros_gripper_group)
++            return True
++        except Exception as exc:
++            self._log('warn', f'ROS gripper publisher 创建失败：{exc}')
++            return False
++
++    def _ros_gripper_timer_cb(self) -> None:
++        from builtin_interfaces.msg import Duration
++        from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
++        target = self._ros_gripper_target
++        if target is None or self._ros_gripper_pub is None:
++            return
++        now = time.monotonic()
++        # Publish immediately after a target change, then keep a 1 Hz
++        # keep-alive. A 20 Hz stream would restart the 0.5 s trajectory before
++        # the gripper can move.
++        if (target == self._ros_last_published_target and
++                now - self._ros_last_publish < 1.0):
++            return
++        joint_name = str(self.params.get('gripper_ros_joint', 'gripper'))
++        msg = JointTrajectory()
++        msg.joint_names = [joint_name]
++        point = JointTrajectoryPoint()
++        point.positions = [float(target)]
++        point.velocities = []
++        point.accelerations = []
++        point.effort = []
++        point.time_from_start = Duration(sec=0, nanosec=500_000_000)
++        msg.points = [point]
++        try:
++            self._ros_gripper_pub.publish(msg)
++            self._ros_last_published_target = target
++            self._ros_last_publish = now
++        except Exception:
++            pass
++
+     def _gripper_set_width(self, cmd_opening_m: float, label: str) -> bool:
+         """夹爪宽度设置（张开/闭合共用；SDK 直控 2026-08-07 用户裁决）。
+ 
+@@ -505,6 +611,16 @@ class GraspExecutor:
+                       f'（SDK 小夹爪最大 {GRIPPER_MAX_OPENING_M:.3f} m），'
+                       f'fail-closed 中止夹爪{label}（N1）')
+             return False
++        if self._gripper_backend == 'ros':
++            self._ros_gripper_target = opening_m
++            if not self._ensure_ros_gripper():
++                return False
++            self._log('info', f'夹爪{label}：ROS gripper 目标 '
++                              f'{opening_m*1000:.1f} mm')
++            # Let the controller actually move before the caller samples
++            # /joint_states_feedback. Sim override documented at the top.
++            time.sleep(_ROS_GRIPPER_SETTLE_S)
++            return True
+         try:
+             if self._piper is None:
+                 from piper_sdk import C_PiperInterface
+@@ -606,7 +722,7 @@ class GraspExecutor:
+             return {'status': 'dry_stop', 'actual_width': None,
+                     'stage': str(max_stage), 'cmd_width': cmd_width}
+ 
+-        # 0) 张开夹爪到最大（2026-08-07 用户裁决：不按宽度换算；SDK 直控）
++        # 0) Full opening is required for the calibration reference.
+         if not self._open_gripper():
+             return self._fail('gripper_open', cmd_width)
+         if 0 >= _stop_idx:
+@@ -623,8 +739,21 @@ class GraspExecutor:
+         if full_closed is None:
+             self._log('warn', '全闭反馈在超时内未稳定，标定 fail-closed')
+             return self._fail('gripper_calib', cmd_width)
+-        if not self._open_gripper():
++        # The simulated gripper overshoots a few microns past 0; clamp the
++        # physical full-closed reference so the strict 0..10 mm validity check
++        # does not reject an otherwise healthy calibration.
++        if full_closed < 0.0:
++            full_closed = 0.0
++        pregrasp_opening = GRIPPER_MAX_OPENING_M
++        if self._gripper_backend == 'ros':
++            pregrasp_opening = float(self.params.get(
++                'sim_pregrasp_opening_m', GRIPPER_MAX_OPENING_M))
++        if pregrasp_opening < cmd_width or pregrasp_opening > GRIPPER_MAX_OPENING_M:
++            return self._fail('gripper_width', cmd_width)
++        if not self._gripper_set_width(pregrasp_opening, '预抓开口'):
+             return self._fail('gripper_open', cmd_width)
++        self._log('info', f'calib raw: full_open={full_open:.6f} m, '
++                          f'full_closed={full_closed:.6f} m')
+         if not gripper_calibration_is_valid(full_open, full_closed):
+             self._log(
+                 'error',
+@@ -664,6 +793,10 @@ class GraspExecutor:
+         #    不依赖候选宽度；物体挡在行程内时夹爪停在物体宽处）
+         if not self._close_gripper(0.0):
+             return self._fail('gripper', cmd_width)
++        # Sim/real gripper controller: give the command time to move the
++        # fingers before sampling, otherwise the stable-window reader can
++        # return the still-open plateau as a "stable" value.
++        time.sleep(FEEDBACK_SETTLE_S)
+ 
+         # 5) 等待连续稳定反馈 → 初判（总开度域，米）。第一条新反馈可能是
+         # 闭合途中的瞬态，不能用于业务判定。
+@@ -672,6 +805,11 @@ class GraspExecutor:
+             self._log('warn', '夹爪反馈在超时内未形成稳定窗口，判定失败并保持姿态')
+             return self._fail('gripper', cmd_width)
+         status, detail = classify_grasp(actual_width, full_open, full_closed)
++        if (self.params.get('gripper_backend') == 'ros'
++                and not (float(self.params.get('sim_min_hold_width', 0.0))
++                         <= actual_width
++                         <= float(self.params.get('sim_max_hold_width', 0.070)))):
++            status, detail = 'grasp_empty', 'implausible_sim_width'
+         self._log('info', f'grasp verdict: actual_width={actual_width:.4f} m '
+                           f'（总开度，闭合命令=完全闭合）, '
+                           f'full_open={full_open:.4f}, full_closed={full_closed:.4f}, '
+@@ -686,11 +824,76 @@ class GraspExecutor:
+                 return self._fail('gripper_hold', cmd_width)
+             held_status, held_detail = classify_grasp(
+                 held_width, full_open, full_closed)
++            if (self.params.get('gripper_backend') == 'ros'
++                    and not (float(self.params.get('sim_min_hold_width', 0.0))
++                             <= held_width
++                             <= float(self.params.get('sim_max_hold_width', 0.070)))):
++                held_status, held_detail = 'grasp_empty', 'implausible_sim_width'
+             self._log('info', f'grasp hold verdict: actual_width={held_width:.4f} m, '
+                               f'detail={held_detail} → {held_status}')
+             actual_width = held_width
+             status = held_status
+ 
+-        # 6) 抬升暂时关闭；判定后直接返回，由 executor 收尾回 zero。
++        # 6) Simulation-only lift: move to the precheck open-lift pose and
++        # verify the block is still between the fingers. Real robot keeps the
++        # historical no-lift behavior unless enable_sim_lift is explicitly set.
++        if status == 'success' and bool(self.params.get('enable_sim_lift', False)):
++            if not self._move_pose(stage_poses['lift']):
++                self._log('error', '仿真抬升规划/执行失败', )
++                return self._fail('lift', cmd_width, actual_width)
++            time.sleep(_ROS_GRIPPER_SETTLE_S)
++            lifted_width = self._read_gripper_feedback_stable()
++            if lifted_width is None:
++                self._log('warn', '抬升后夹爪反馈无稳定值，fail-closed')
++                return self._fail('lift_hold', cmd_width, actual_width)
++            lifted_status, lifted_detail = classify_grasp(
++                lifted_width, full_open, full_closed)
++            self._log('info', f'lift verdict: actual_width={lifted_width:.4f} m, '
++                              f'detail={lifted_detail} → {lifted_status}')
++            actual_width = lifted_width
++            status = lifted_status
++            # A 4 cm block cannot physically leave a 7-8 mm opening; treat a
++            # near-closed width after lift as a slip, not a successful hold.
++            min_hold_width = max(0.020, float(self.params.get('sim_min_hold_width', 0.0)))
++            max_hold_width = float(self.params.get('sim_max_hold_width', 0.070))
++            if not min_hold_width <= actual_width <= max_hold_width:
++                self._log('warn', f'lift width {actual_width*1000:.1f} mm '
++                                  f'outside {min_hold_width*1000:.1f}..'
++                                  f'{max_hold_width*1000:.1f} mm；'
++                                  '判定木块未稳定夹持')
++                status = 'grasp_empty'
++            if status != 'success':
++                return self._fail('lift_hold', cmd_width, actual_width)
++
+         return {'status': status, 'actual_width': actual_width, 'stage': '',
+                 'cmd_width': cmd_width}
++
++    def execute_sim_place(self, stage_poses: dict,
++                          release_height_m: float = 0.03) -> dict:
++        """Return a held simulated block near its pickup point and release it.
++
++        This path is opt-in at the ROS node and is never used by the real SDK
++        backend. A release pose between the already checked grasp/lift poses
++        keeps the fingers clear of the table while limiting drop distance.
++        """
++        if self._gripper_backend != 'ros' or not self.params.get('enable_sim_lift'):
++            return {'success': False, 'stage': 'disabled', 'released': False}
++        grasp = stage_poses['grasp']
++        release_pose = {
++            'pos': [float(grasp['pos'][0]), float(grasp['pos'][1]),
++                    float(grasp['pos'][2]) + float(release_height_m)],
++            'quat': list(grasp['quat']),
++        }
++        if not self._move_pose(release_pose):
++            return {'success': False, 'stage': 'lower', 'released': False}
++        if not self._open_gripper():
++            return {'success': False, 'stage': 'release', 'released': False}
++        opening = self._read_gripper_feedback_stable()
++        if opening is None or opening < 0.065:
++            return {'success': False, 'stage': 'release_feedback',
++                    'released': True, 'opening_m': opening}
++        if not self._move_pose(stage_poses['lift']):
++            return {'success': False, 'stage': 'retreat',
++                    'released': True, 'opening_m': opening}
++        return {'success': True, 'stage': 'released',
++                'released': True, 'opening_m': opening}
+diff --git a/src/real_piper_perception/real_piper_perception/grasp_executor.py b/src/real_piper_perception/real_piper_perception/grasp_executor.py
+index 8cd0efc..449a038 100644
+--- a/src/real_piper_perception/real_piper_perception/grasp_executor.py
++++ b/src/real_piper_perception/real_piper_perception/grasp_executor.py
+@@ -43,6 +43,8 @@ from scipy.spatial.transform import Rotation
+ from rclpy.callback_groups import ReentrantCallbackGroup
+ from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
+ from rclpy.node import Node
++from rcl_interfaces.msg import ParameterType
++from rcl_interfaces.srv import GetParameters
+ from std_msgs.msg import String
+ from moveit_msgs.srv import GetPositionFK
+ from std_srvs.srv import Trigger
+@@ -60,6 +62,7 @@ from real_piper_perception.gripper_limits import (
+ )
+ from real_piper_perception.grasp_precheck import Prechecker
+ from real_piper_perception.grasp_transform import load_handeye
++from real_piper_perception.real_hold_place import RealHoldPlace
+ 
+ # 2026-08-14 用户裁决：预检规划与真机抓取以 zero 为初始位姿，收尾也回 zero
+ # （取代 2026-08-10 的 ready 语义）。zero = SRDF <group_state name="zero"
+@@ -67,6 +70,20 @@ from real_piper_perception.grasp_transform import load_handeye
+ # 注：ready/zero 起点对预检结果无差异（2026-08-14 受控 A/B 实测，逐候选 0 不一致）。
+ ZERO_JOINTS = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+ 
++# Simulation-only override: at the real robot's zero pose the tabletop sim
++# gripper is obstructed by the pedestal, so calibration there cannot reach a
++# fully-closed reading. Set GRASP_ZERO_JOINTS to a clear joint pose (e.g. the
++# SRDF "ready" pose) to calibrate and start/end the flow there. Real robot
++# leaves this unset and keeps the historical zero pose.
++_env_zero_joints = os.environ.get('GRASP_ZERO_JOINTS', '').strip()
++if _env_zero_joints:
++    try:
++        _vals = [float(v) for v in _env_zero_joints.split(',')]
++        if len(_vals) == 6:
++            ZERO_JOINTS = _vals
++    except ValueError:
++        pass
++
+ 
+ class GraspExecutorNode(Node):
+     """主节点：grasp_execute 服务触发完整抓取流程，结果落盘 + 广播。"""
+@@ -79,6 +96,7 @@ class GraspExecutorNode(Node):
+         # 参数声明（brief 参数清单，默认值原样；handeye_yaml 用 camera_data 真实文件）
+         # ------------------------------------------------------------------
+         self.declare_parameter('velocity_scale', 0.02)
++        self.declare_parameter('pose_goal_box_m', 0.02)
+         # scan_only: 节点默认 false；launch 默认 true（仅预检 dry-run，臂不动）。
+         # 切 false 需现场二次确认（真机抓取执行）。
+         self.declare_parameter('scan_only', False)
+@@ -98,6 +116,21 @@ class GraspExecutorNode(Node):
+ 
+         self.declare_parameter('gripper_margin', 0.005)
+         self.declare_parameter('gripper_detect_threshold', 0.01)
++        # 'sdk' = real Piper SDK; 'ros' = /gripper_controller topic (simulation)
++        self.declare_parameter('gripper_backend', 'sdk')
++        # Debug/simulation only: leave the arm at the final pose instead of
++        # returning to zero, so the grasp pose can be inspected.
++        self.declare_parameter('skip_final_home', False)
++        self.declare_parameter('sim_home_on_failure', False)
++        # Simulation-only: attempt a 10 cm lift after a successful grasp.
++        self.declare_parameter('enable_sim_lift', False)
++        self.declare_parameter('sim_min_hold_width', 0.0)
++        self.declare_parameter('sim_max_hold_width', 0.070)
++        self.declare_parameter('sim_pregrasp_opening_m', 0.070)
++        self.declare_parameter('enable_sim_place_service', False)
++        self.declare_parameter('sim_release_height_m', 0.03)
++        self.declare_parameter('enable_real_hold_place', False)
++        self.declare_parameter('real_hold_place_motion', False)
+         # I2 修复：默认候选数 1 → 50（真实 CSV 37 候选、rank[0] 门控漂移时
+         # 默认配置曾导致 tested=0，流程永不执行；设计上限 300，M4 钳制）
+         # 2026-08-14 用户裁决：50 → 150（扩大被检候选集，缓解"高分候选
+@@ -119,6 +152,7 @@ class GraspExecutorNode(Node):
+         self.declare_parameter('piper_analytic_ik_max_solutions', 8)
+         self.declare_parameter('piper_analytic_ik_max_solution_plans', 6)
+         self.declare_parameter('planning_time_precheck', 0.5)
++        self.declare_parameter('precheck_lift', False)
+         self.declare_parameter('planning_time_exec', 10.0)
+ 
+         # ------------------------------------------------------------------
+@@ -156,6 +190,8 @@ class GraspExecutorNode(Node):
+         # 服务 + 结果发布器
+         # ------------------------------------------------------------------
+         self._srv = self.create_service(Trigger, 'grasp_execute', self._on_grasp_execute)
++        self._place_srv = self.create_service(
++            Trigger, 'tabletop_place', self._on_tabletop_place)
+         # 夹爪朝向 FK 验证 client（2026-08-07）：独立 Reentrant 组——默认
+         # MutuallyExclusive 组下 wait_for_service/call 会超时（与适配器同根源）
+         self._fk_client = self.create_client(
+@@ -180,6 +216,7 @@ class GraspExecutorNode(Node):
+                 self.get_parameter('piper_analytic_ik_max_solution_plans').value),
+             'planning_time_precheck': float(
+                 self.get_parameter('planning_time_precheck').value),
++            'precheck_lift': bool(self.get_parameter('precheck_lift').value),
+         }
+         self._prechecker = Prechecker(
+             node=self, move_group=move_group,
+@@ -191,6 +228,15 @@ class GraspExecutorNode(Node):
+             'gripper_detect_threshold': self._gripper_detect_threshold,
+             'lift_z': self._lift_z,
+             'planning_time_exec': float(self.get_parameter('planning_time_exec').value),
++            'gripper_backend': str(self.get_parameter('gripper_backend').value),
++            'enable_sim_lift': bool(
++                self.get_parameter('enable_sim_lift').value),
++            'sim_min_hold_width': float(
++                self.get_parameter('sim_min_hold_width').value),
++            'sim_max_hold_width': float(
++                self.get_parameter('sim_max_hold_width').value),
++            'sim_pregrasp_opening_m': float(
++                self.get_parameter('sim_pregrasp_opening_m').value),
+         }
+         # C2 修复：夹爪闭合走独立 gripper 组（gripper_move_group）
+         self._executor = GraspExecutor(
+@@ -200,6 +246,23 @@ class GraspExecutorNode(Node):
+         # 并发触发互斥（服务 + 键盘可同时触发同一流程）
+         self._flow_lock = threading.Lock()
+         self._keyboard_thread: threading.Thread | None = None
++        self._last_sim_pick_poses: dict | None = None
++        self._real_cycle = None
++        if self.get_parameter('enable_real_hold_place').value:
++            if self._scan_only or exec_params['gripper_backend'] != 'sdk' or move_group is None:
++                raise RuntimeError('真机保持放置需要 SDK 后端和 MoveIt 适配器')
++            self._real_cycle = RealHoldPlace(
++                self._executor, bool(self.get_parameter('real_hold_place_motion').value),
++                [0.0] * 6)
++            self._real_control_group = ReentrantCallbackGroup()
++            self._real_preview_services = []
++            self._real_services = [
++                self.create_service(Trigger, 'real_hold_prepare', self._on_real_prepare),
++                self.create_service(Trigger, 'real_hold_status', self._on_real_status,
++                                    callback_group=self._real_control_group),
++                self.create_service(Trigger, 'real_hold_cancel', self._on_real_cancel,
++                                    callback_group=self._real_control_group),
++            ]
+ 
+         self.get_logger().info(
+             'grasp_executor started:\n'
+@@ -233,6 +296,8 @@ class GraspExecutorNode(Node):
+         （Task 9 干跑联调接线：/move_group 规划 + /execute_trajectory 执行）。
+         """
+         try:
++            if self.get_parameter('enable_real_hold_place').value:
++                raise ImportError('真机保持放置使用支持反馈与取消的 MoveIt 适配器')
+             from moveit_py.core import MoveGroupInterface
+         except Exception as exc:
+             self.get_logger().info(
+@@ -299,6 +364,173 @@ class GraspExecutorNode(Node):
+         response.message = report['message']
+         return response
+ 
++    def _on_tabletop_place(self, request, response):
++        """Simulation-only return, release, retreat, and home service."""
++        box: dict = {}
++
++        def worker() -> None:
++            box['report'] = self._run_tabletop_place()
++
++        thread = threading.Thread(target=worker, daemon=True,
++                                  name='tabletop_place_flow')
++        thread.start()
++        thread.join()
++        report = box.get('report', {'success': False, 'stage': 'thread_died'})
++        response.success = bool(report.get('success'))
++        response.message = json.dumps(report, ensure_ascii=False)
++        return response
++
++    @staticmethod
++    def _real_reply(response, report):
++        response.success = bool(report['success'])
++        response.message = json.dumps(report, ensure_ascii=False)
++        return response
++
++    def _on_real_status(self, request, response):
++        return self._real_reply(response, self._real_cycle.status())
++
++    def _on_real_cancel(self, request, response):
++        cycle = self._real_cycle
++        if cycle.state not in {'prepared', 'held', 'picking', 'placing'}:
++            return self._real_reply(response, {**cycle.status(), 'stop_requested': False})
++        cycle.cancel.set()
++        return self._real_reply(response, {**cycle.status(), 'stop_requested': True})
++
++    def _run_real_command(self, response, command, *, motion=False):
++        cycle = self._real_cycle
++        if not self._flow_lock.acquire(blocking=False):
++            return self._real_reply(response, {'success': False, 'error': '执行器正在处理其他动作'})
++        try:
++            sources = self.get_publishers_info_by_topic('/joint_states_feedback')
++            if ('/clock' in dict(self.get_topic_names_and_types()) or len(sources) != 1
++                    or sources[0].node_name not in {'piper_ctrl_single_node', 'piper_single_ctrl'}):
++                raise RuntimeError('需要唯一的真机 PiPER 反馈源及独立 ROS 域')
++            if motion and cycle.motion_enabled:
++                self._check_real_gripper_owner(sources[0])
++            report = command()
++        except Exception as exc:
++            if cycle.state in {'picking', 'placing'}:
++                cycle.state = 'needs_recovery'
++            self.get_logger().warn(f'真机保持放置：{exc}')
++            report = {**cycle.status(), 'success': False, 'error': str(exc)}
++        finally:
++            self._flow_lock.release()
++        return self._real_reply(response, report)
++
++    def _check_real_gripper_owner(self, source):
++        namespace = source.node_namespace.rstrip('/')
++        name = f'{namespace}/{source.node_name}/get_parameters'
++        client = self.create_client(
++            GetParameters, name, callback_group=self._real_control_group)
++        try:
++            if not client.wait_for_service(timeout_sec=2.0):
++                raise RuntimeError('无法核对 PiPER 驱动的夹爪转发配置')
++            request = GetParameters.Request(names=['gripper_forward'])
++            future = client.call_async(request)
++            deadline = time.monotonic() + 2.0
++            while not future.done() and time.monotonic() < deadline:
++                time.sleep(0.02)
++            result = future.result() if future.done() else None
++            if (result is None or len(result.values) != 1
++                    or result.values[0].type != ParameterType.PARAMETER_BOOL
++                    or result.values[0].bool_value):
++                raise RuntimeError('请以 gripper_forward:=false 启动真机驱动，避免双源控制夹爪')
++        finally:
++            self.destroy_client(client)
++
++    def _on_real_prepare(self, request, response):
++        return self._run_real_command(response, self._prepare_real_cycle)
++
++    def _prepare_real_cycle(self):
++        cycle = self._real_cycle
++        if cycle.status()['state'] not in {'idle', 'placed', 'expired'}:
++            raise RuntimeError('当前已有预演或持物任务，请查询状态')
++        cycle.cancel.clear()
++        path = self._resolve_csv_path()
++        modified = cycle.check_frame(path)
++        candidates = rank_candidates(parse_grasp_csv(path))
++        if os.stat(path).st_mtime_ns != modified:
++            raise RuntimeError('读取候选时帧已更新，请重试预演')
++        candidates = [cand for cand in candidates
++                      if fits_small_gripper(cand.width, self._gripper_margin)
++                      and cand.score >= self._grasp_score_min
++                      and self_consistency(cand)]
++        error = '没有通过宽度和中心一致性检查的候选'
++        for cand in candidates[:3]:
++            poses = self._prechecker.make_stage_poses(
++                cand, self._handeye, self._approach_clearance, self._lift_z,
++                self._open_gripper_lift_height, self._grasp_z_offset)
++            try:
++                report = cycle.prepare(cand.name, poses, cand.center_camera)
++                for service in self._real_preview_services:
++                    self.destroy_service(service)
++                preview_id = report['preview_id']
++                self._real_preview_services = [
++                    self.create_service(
++                        Trigger, f'/real_hold_pick/p{preview_id}',
++                        lambda req, res: self._on_real_pick(res, preview_id)),
++                    self.create_service(
++                        Trigger, f'/real_hold_place/p{preview_id}',
++                        lambda req, res: self._on_real_place(res, preview_id)),
++                ]
++                return report
++            except RuntimeError as exc:
++                error = str(exc)
++        raise RuntimeError(error)
++
++    def _on_real_pick(self, response, preview_id):
++        def pick():
++            cycle = self._real_cycle
++            preview = cycle._ready('prepared')
++            if preview.id != preview_id:
++                raise RuntimeError('预演已替换')
++            path = self._resolve_csv_path()
++            modified = cycle.check_frame(path)
++            candidates = parse_grasp_csv(path)
++            if os.stat(path).st_mtime_ns != modified or not any(
++                cand.name == preview.candidate
++                and sum((cand.center_camera - preview.center_camera) ** 2) <= 0.01 ** 2
++                for cand in candidates
++            ):
++                raise RuntimeError('最新感知与预演的物体位置不一致')
++            return cycle.pick()
++        return self._run_real_command(response, pick, motion=True)
++
++    def _on_real_place(self, response, preview_id):
++        def place():
++            if self._real_cycle._ready('held').id != preview_id:
++                raise RuntimeError('持物任务已替换')
++            return self._real_cycle.place()
++        return self._run_real_command(response, place, motion=True)
++
++    def _run_tabletop_place(self) -> dict:
++        if not bool(self.get_parameter('enable_sim_place_service').value):
++            return {'success': False, 'stage': 'disabled'}
++        if not self._flow_lock.acquire(blocking=False):
++            return {'success': False, 'stage': 'busy'}
++        try:
++            poses = self._last_sim_pick_poses
++            if poses is None:
++                return {'success': False, 'stage': 'no_held_pick'}
++            result = self._executor.execute_sim_place(
++                poses, float(self.get_parameter('sim_release_height_m').value))
++            if result.get('released'):
++                self._last_sim_pick_poses = None
++            if not result.get('success'):
++                return result
++            home = self._goto_joints(ZERO_JOINTS, '放置后回 zero')
++            result['home'] = home
++            result['success'] = bool(home)
++            if not home:
++                result['stage'] = 'home'
++            return result
++        except Exception as exc:
++            self.get_logger().error(
++                f'tabletop_place exception: {exc!r}\n{traceback.format_exc()}')
++            return {'success': False, 'stage': 'exception', 'error': str(exc)}
++        finally:
++            self._flow_lock.release()
++
+     def _run_flow_in_thread(self, trigger: str) -> dict:
+         """在后台线程执行流程并等待结果（服务回调专用；键盘线程直接调 _run_flow）。"""
+         box: dict = {}
+@@ -354,6 +586,8 @@ class GraspExecutorNode(Node):
+ 
+         互斥：一次只跑一个流程（键盘与服务并发触发时，后者忽略并告警）。
+         """
++        if getattr(self, '_real_cycle', None) is not None:
++            return {'success': False, 'message': '此节点由真机保持放置流程管理'}
+         if not self._flow_lock.acquire(blocking=False):
+             msg = f'grasp flow already running; ignore trigger={trigger}'
+             self.get_logger().warn(msg)
+@@ -362,17 +596,25 @@ class GraspExecutorNode(Node):
+         #（写 pause_inference 标记 → 推理跳过帧、CSV 冻结在执行前干净帧）；
+         # 流程结束（无论结果，A 方案）机械臂归零完成后删除标记恢复推理。
+         self._set_pause_marker()
++        report = None
+         try:
+-            return self._run_flow_impl(trigger)
++            report = self._run_flow_impl(trigger)
++            return report
+         except Exception as exc:
+             self.get_logger().error(
+                 f'grasp flow exception: {exc!r}\n{traceback.format_exc()}')
+-            return {'success': False, 'message': f'grasp flow exception: {exc!r}'}
++            report = {'success': False, 'message': f'grasp flow exception: {exc!r}'}
++            return report
+         finally:
+             # 收尾回 zero（2026-08-14 用户裁决：抓取完成后归零，
+             # 取代 2026-08-10 的回 ready；scan_only 不动臂，跳过）；
+             # 失败不阻塞恢复
+-            if not self._scan_only:
++            skip_final_home = bool(
++                self.get_parameter('skip_final_home').value) \
++                if self.has_parameter('skip_final_home') else False
++            home_on_failure = bool(self.get_parameter('sim_home_on_failure').value)
++            if not self._scan_only and (not skip_final_home or
++                                        (home_on_failure and not (report or {}).get('success'))):
+                 try:
+                     if not self._goto_joints(ZERO_JOINTS, '回 zero'):
+                         self.get_logger().warn('收尾回 zero 失败（继续恢复推理）')
+@@ -422,6 +664,8 @@ class GraspExecutorNode(Node):
+             self.get_logger().warn(f'写 precheck_results.json 失败（{exc}）')
+ 
+     def _run_flow_impl(self, trigger: str) -> dict:
++        if not self._scan_only:
++            self._last_sim_pick_poses = None
+         # ---- 1. 读 csv_path 最近文件 → parse_grasp_csv ----
+         csv_path = self._resolve_csv_path()
+         if not os.path.isfile(csv_path):
+@@ -572,6 +816,9 @@ class GraspExecutorNode(Node):
+         width = float(selected.width)
+         pick = self._executor.execute_pick(
+             selected_stage_poses, width, max_stage=self._dry_run_max_stage or None)
++        if (pick.get('status') == 'success'
++                and bool(self.get_parameter('enable_sim_place_service').value)):
++            self._last_sim_pick_poses = selected_stage_poses
+ 
+         # 2026-08-07 用户要求：执行后（收尾归零前）FK 验证夹爪实际朝向
+         #（采样 mock 终态 = 执行后姿态，参考 URDF joint7 X90° 建模）
+diff --git a/src/real_piper_perception/real_piper_perception/grasp_precheck.py b/src/real_piper_perception/real_piper_perception/grasp_precheck.py
+index 2eb6edb..ed3457a 100644
+--- a/src/real_piper_perception/real_piper_perception/grasp_precheck.py
++++ b/src/real_piper_perception/real_piper_perception/grasp_precheck.py
+@@ -424,7 +424,7 @@ class Prechecker:
+         results = {name: False for name in STAGE_ORDER}
+         tested = 0
+         for name in STAGE_ORDER:
+-            if name == 'lift':
++            if name == 'lift' and not self.params.get('precheck_lift', False):
+                 # 2026-08-10 用户裁决：预检关掉 lift 段——ready 起点下
+                 # lift 段规划经常失败导致候选误拒（实测 approach+grasp 过、
+                 # lift 挂）；lift 可达性由执行段验证。results 保留 lift 键
+@@ -437,7 +437,8 @@ class Prechecker:
+             results[name] = self.precheck_pose(stage_poses[name], label)
+             if not results[name]:
+                 break
+-        all_pass = bool(results['approach'] and results['grasp'])
++        all_pass = bool(results['approach'] and results['grasp']
++                        and (not self.params.get('precheck_lift', False) or results['lift']))
+         if scan_only_report:
+             self._log('info', f'target GraspNet 6D scan summary: tested={tested}, '
+                               f'approach_pass={int(results["approach"])}, '
+diff --git a/src/real_piper_perception/real_piper_perception/moveit_adapter.py b/src/real_piper_perception/real_piper_perception/moveit_adapter.py
+index 78d1dea..642ccd8 100644
+--- a/src/real_piper_perception/real_piper_perception/moveit_adapter.py
++++ b/src/real_piper_perception/real_piper_perception/moveit_adapter.py
+@@ -17,6 +17,7 @@ humble 无 moveit_py / moveit_commander（apt 与 pip 均无）→ 手写适配
+ from __future__ import annotations
+ 
+ import time
++import math
+ 
+ from moveit_msgs.action import ExecuteTrajectory, MoveGroup
+ from moveit_msgs.msg import (
+@@ -99,6 +100,38 @@ class MoveGroupInterface:
+     def _joint_state_cb(self, msg: JointState) -> None:
+         self._joint_state = msg
+ 
++    def enable_hardware_feedback(self) -> None:
++        self._hardware_sample = None
++        self._hardware_sub = self._node.create_subscription(
++            JointState, '/joint_states_feedback', self._hardware_state_cb, 1,
++            callback_group=self._cb_group)
++
++    def _hardware_state_cb(self, msg: JointState) -> None:
++        self._hardware_sample = (msg, time.monotonic())
++
++    def hardware_joints(self) -> dict[str, float]:
++        sample = self._hardware_sample
++        if sample is None:
++            raise RuntimeError('尚未收到真机关节反馈')
++        msg, received = sample
++        stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
++        age = self._node.get_clock().now().nanoseconds * 1e-9 - stamp
++        if stamp <= 0 or not -0.1 <= age <= 0.5 or time.monotonic() - received > 0.5:
++            raise RuntimeError('真机关节反馈已过期')
++        values = dict(zip(msg.name, msg.position))
++        if not all(name in values and math.isfinite(values[name])
++                   for name in (*self._joint_names, 'gripper')):
++            raise RuntimeError('真机关节或夹爪反馈缺失')
++        return {name: float(values[name]) for name in self._joint_names}
++
++    def set_planning_start(self, joints: dict[str, float]) -> None:
++        state = RobotState()
++        state.is_diff = True
++        state.joint_state.name = [*joints, 'joint7', 'joint8']
++        # Model the open fingers throughout this vertical return cycle.
++        state.joint_state.position = [*joints.values(), 0.035, -0.035]
++        self._start_state = state
++
+     def _wait_future(self, future, timeout_s: float) -> bool:
+         """轮询等待 rclpy Future 完成（不依赖当前线程 spin——MTE 回调线程安全；
+         rclpy Future.result() 不支持 timeout 关键字）。异常视为失败。"""
+@@ -184,7 +217,7 @@ class MoveGroupInterface:
+         request.num_planning_attempts = 1
+         request.allowed_planning_time = self._planning_time
+         request.max_velocity_scaling_factor = self._velocity_scale
+-        request.max_acceleration_scaling_factor = 1.0
++        request.max_acceleration_scaling_factor = self._velocity_scale
+         if self._start_state is not None:
+             request.start_state = self._start_state
+         if self._joint_target is not None:
+@@ -210,8 +243,12 @@ class MoveGroupInterface:
+             posc.target_point_offset.y = 0.0
+             posc.target_point_offset.z = 0.0
+             posc.constraint_region.primitive_poses.append(pose)
++            box_m = 0.02
++            if self._node.has_parameter('pose_goal_box_m'):
++                box_m = float(self._node.get_parameter('pose_goal_box_m').value)
++            box_m = max(0.002, min(box_m, 0.05))
+             posc.constraint_region.primitives.append(
+-                _make_box_primitive(0.02, 0.02, 0.02))  # ±1cm 位置容差
++                _make_box_primitive(box_m, box_m, box_m))
+             posc.weight = 1.0
+             constraints.position_constraints.append(posc)
+             oric = OrientationConstraint()
+@@ -262,23 +299,48 @@ class MoveGroupInterface:
+         # 包装成带 .trajectory 的对象与调用侧契约一致
+         return _PlanResult(result.planned_trajectory)
+ 
+-    def execute(self, plan) -> bool:
++    def execute(self, plan, cancel_event=None) -> bool:
+         if plan is None or plan.trajectory is None:
+             return False
+         goal = ExecuteTrajectory.Goal()
+         goal.trajectory = plan.trajectory
+         if not self._exec_action.wait_for_server(timeout_sec=_SERVICE_TIMEOUT_S):
+             raise RuntimeError('/execute_trajectory action server 不可用')
++        if cancel_event is not None and cancel_event.is_set():
++            return False
+         # 同 plan()：humble send_goal 阻塞式，必须用 send_goal_async + 轮询等待
+         send_future = self._exec_action.send_goal_async(goal)
+         if not self._wait_future(send_future, _SERVICE_TIMEOUT_S):
++            if cancel_event is not None:
++                def cancel_late_goal(future):
++                    handle = future.result()
++                    if handle is not None and handle.accepted:
++                        handle.cancel_goal_async()
++                send_future.add_done_callback(cancel_late_goal)
+             return False
+         goal_handle = send_future.result()
+         if goal_handle is None or not goal_handle.accepted:
+             return False
+         result_future = goal_handle.get_result_async()
+-        if not self._wait_future(result_future, _ACTION_TIMEOUT_S):
+-            return False
++        if cancel_event is None:
++            if not self._wait_future(result_future, _ACTION_TIMEOUT_S):
++                return False
++        else:
++            duration = plan.trajectory.joint_trajectory.points[-1].time_from_start
++            deadline = time.monotonic() + duration.sec + duration.nanosec * 1e-9 + 10
++            while not result_future.done():
++                try:
++                    self.hardware_joints()
++                    feedback_ok = True
++                except RuntimeError:
++                    feedback_ok = False
++                if cancel_event.is_set() or time.monotonic() > deadline or not feedback_ok:
++                    goal_handle.cancel_goal_async()
++                    self._wait_future(result_future, 5.0)
++                    return False
++                time.sleep(0.05)
++            if result_future.exception() is not None or cancel_event.is_set():
++                return False
+         # 同 plan()：GetResult_Response 包装，.result 才是 ExecuteTrajectory.Result
+         result = result_future.result().result
+         return bool(result is not None and result.error_code.val == 1)
+@@ -301,6 +363,8 @@ class MoveGroupInterface:
+         req.max_step = float(eef_step)
+         req.jump_threshold = float(jump_threshold)
+         req.avoid_collisions = bool(avoid_collisions)
++        req.max_velocity_scaling_factor = self._velocity_scale
++        req.max_acceleration_scaling_factor = self._velocity_scale
+         future = self._cart_service.call_async(req)
+         deadline = time.monotonic() + _SERVICE_TIMEOUT_S
+         while not future.done():
+diff --git a/src/real_piper_perception/test/test_moveit_adapter.py b/src/real_piper_perception/test/test_moveit_adapter.py
+index 5114878..289c693 100644
+--- a/src/real_piper_perception/test/test_moveit_adapter.py
++++ b/src/real_piper_perception/test/test_moveit_adapter.py
+@@ -38,6 +38,7 @@ def _interface(response):
+     interface._group_name = 'arm'
+     interface._end_effector_link = 'link6'
+     interface._start_state = None
++    interface._velocity_scale = 0.02
+     interface._cart_service = _CartesianService(response)
+     return interface
+ 
+@@ -59,6 +60,7 @@ def test_cartesian_path_uses_humble_solution_field():
+     assert plan.trajectory is interface._cart_service.response.solution
+     assert fraction == 1.0
+     assert interface._cart_service.request.max_step == 0.01
++    assert interface._cart_service.request.max_velocity_scaling_factor == 0.02
+ 
+ 
+ def test_cartesian_path_rejects_error_code():
+diff --git a/src/real_piper_yolo_graspnet/real_piper_yolo_graspnet/d435i_yolo_graspnet_bridge.py b/src/real_piper_yolo_graspnet/real_piper_yolo_graspnet/d435i_yolo_graspnet_bridge.py
+index 698e667..08e9d61 100644
+--- a/src/real_piper_yolo_graspnet/real_piper_yolo_graspnet/d435i_yolo_graspnet_bridge.py
++++ b/src/real_piper_yolo_graspnet/real_piper_yolo_graspnet/d435i_yolo_graspnet_bridge.py
+@@ -6,7 +6,7 @@ from __future__ import annotations
+ import json
+ import os
+ from pathlib import Path
+-import signal
++import time
+ 
+ import message_filters
+ import numpy as np
+@@ -101,6 +101,8 @@ class D435iYoloGraspNetBridge(Node):
+         self.declare_parameter('factor_depth', 1000.0)
+         self.declare_parameter('depth_is_meters', False)
+         self.declare_parameter('write_overlay', True)
++        self.declare_parameter('require_consumer', True)
++        self.declare_parameter('publish_rate_hz', 0.0)
+         self.declare_parameter('sync_queue_size', 8)
+         self.declare_parameter('sync_slop', 0.05)
+         self.declare_parameter('color_topic', '/camera/camera/color/image_raw')
+@@ -127,6 +129,11 @@ class D435iYoloGraspNetBridge(Node):
+         self.max_depth_m = float(self.get_parameter('max_depth_m').value)
+         self.use_calibration_intrinsics = bool(
+             self.get_parameter('use_calibration_intrinsics').value)
++        self.require_consumer = bool(
++            self.get_parameter('require_consumer').value)
++        self.publish_rate_hz = float(
++            self.get_parameter('publish_rate_hz').value)
++        self._last_frame_time: float | None = None
+ 
+         model_path = str(Path(str(self.get_parameter('model_path').value)).expanduser())
+         self.detector = YoloSegmentationDetector(
+@@ -142,6 +149,7 @@ class D435iYoloGraspNetBridge(Node):
+         self.writer = FrameBundleWriter(
+             str(self.get_parameter('shared_dir').value),
+             write_overlay=bool(self.get_parameter('write_overlay').value),
++            require_consumer=self.require_consumer,
+         )
+         self.cv_bridge = CvBridge()
+         self.latest_camera_info: CameraInfo | None = None
+@@ -187,7 +195,8 @@ class D435iYoloGraspNetBridge(Node):
+             f'  backend:     {self.detector.backend_name}\n'
+             f'  target:      {self.target_class or "any"}\n'
+             f'  shared_dir:  {self.writer.shared_dir}\n'
+-            f'  fail_multi:  {self.fail_on_multiple}'
++            f'  fail_multi:  {self.fail_on_multiple}\n'
++            f'  consume_gate: {self.require_consumer}'
+         )
+ 
+     @staticmethod
+@@ -224,7 +233,16 @@ class D435iYoloGraspNetBridge(Node):
+ 
+     def _rgbd_callback(self, color_message: Image, depth_message: Image) -> None:
+         if self.writer.busy:
++            self.get_logger().warning(
++                'Waiting for the consumer to clear .ready; skipping RGB-D frame.',
++                throttle_duration_sec=5.0)
+             return
++        now = time.monotonic()
++        if self.publish_rate_hz > 0.0:
++            interval = 1.0 / self.publish_rate_hz
++            if self._last_frame_time is not None and now - self._last_frame_time < interval:
++                return
++            self._last_frame_time = now
+         if self.latest_camera_info is None:
+             self.get_logger().warning(
+                 'Waiting for CameraInfo before YOLO inference.', throttle_duration_sec=5.0)
+@@ -305,13 +323,6 @@ class D435iYoloGraspNetBridge(Node):
+ def main(args=None):
+     rclpy.init(args=args)
+     node = D435iYoloGraspNetBridge()
+-
+-    def handle_signal(_signal, _frame):
+-        if rclpy.ok():
+-            rclpy.shutdown()
+-
+-    signal.signal(signal.SIGINT, handle_signal)
+-    signal.signal(signal.SIGTERM, handle_signal)
+     try:
+         rclpy.spin(node)
+     except KeyboardInterrupt:
+diff --git a/src/real_piper_yolo_graspnet/real_piper_yolo_graspnet/frame_writer.py b/src/real_piper_yolo_graspnet/real_piper_yolo_graspnet/frame_writer.py
+index 647baf4..7981536 100644
+--- a/src/real_piper_yolo_graspnet/real_piper_yolo_graspnet/frame_writer.py
++++ b/src/real_piper_yolo_graspnet/real_piper_yolo_graspnet/frame_writer.py
+@@ -23,16 +23,24 @@ class FrameBundleWriter:
+     frames cannot be mixed.
+     """
+ 
+-    def __init__(self, shared_dir: str, write_overlay: bool = True):
++    def __init__(
++        self,
++        shared_dir: str,
++        write_overlay: bool = True,
++        require_consumer: bool = True,
++    ):
+         self.shared_dir = Path(shared_dir).expanduser().resolve()
+         self.shared_dir.mkdir(parents=True, exist_ok=True)
+         self.ready_path = self.shared_dir / '.ready'
+         self.write_overlay = bool(write_overlay)
++        self.require_consumer = bool(require_consumer)
+         self.sequence = 0
+ 
+     @property
+     def busy(self) -> bool:
+-        return self.ready_path.exists()
++        # Without a GraspNet consumer (simulation) the flag has no one to
++        # clear it; let the producer keep replacing frames instead.
++        return self.require_consumer and self.ready_path.exists()
+ 
+     def _temporary_path(self, path: Path, suffix: str = '') -> Path:
+         return path.with_name(
+diff --git a/src/real_piper_yolo_graspnet/real_piper_yolo_graspnet/yolo_detector.py b/src/real_piper_yolo_graspnet/real_piper_yolo_graspnet/yolo_detector.py
+index e2eb2d7..82dcffa 100644
+--- a/src/real_piper_yolo_graspnet/real_piper_yolo_graspnet/yolo_detector.py
++++ b/src/real_piper_yolo_graspnet/real_piper_yolo_graspnet/yolo_detector.py
+@@ -9,6 +9,7 @@ from __future__ import annotations
+ 
+ from dataclasses import dataclass
+ import hashlib
++import os
+ from pathlib import Path
+ import sys
+ from typing import Sequence
+@@ -17,12 +18,20 @@ import cv2
+ import numpy as np
+ 
+ 
+-TABLETOP_CLASS_NAMES = (
++_DEFAULT_TABLETOP_CLASS_NAMES = (
+     'pen', 'pencil', 'marker', 'eraser', 'ruler', 'scissors', 'stapler',
+     'tape', 'sharpener', 'block', 'cup', 'bottle', 'book', 'phone',
+     'mouse', 'remote',
+ )
+ 
++# Temporary override for trying a different YOLO model (e.g. the one trained
++# in piper_tabletop_sim). Unset TABLETOP_YOLO_CLASS_NAMES to restore the
++# original 16-class tabletop model.
++_env_class_names = os.environ.get('TABLETOP_YOLO_CLASS_NAMES', '').strip()
++TABLETOP_CLASS_NAMES = tuple(
++    name.strip() for name in _env_class_names.split(',') if name.strip()
++) or _DEFAULT_TABLETOP_CLASS_NAMES
++
+ 
+ @dataclass(frozen=True)
+ class LetterboxTransform:
+@@ -241,7 +250,18 @@ class _OnnxRuntimeBackend:
+             provider for provider in ('CUDAExecutionProvider', 'CPUExecutionProvider')
+             if provider in available
+         ]
+-        self.session = ort.InferenceSession(model_path, providers=preferred or available)
++        # The simulated camera can saturate a desktop when ONNX Runtime uses
++        # every logical CPU by default. Keep the real camera's default unless
++        # the simulation launcher explicitly sets a thread limit.
++        threads = int(os.environ.get('YOLO_ONNX_INTRA_OP_THREADS', '0'))
++        options = None
++        if threads > 0:
++            options = ort.SessionOptions()
++            options.intra_op_num_threads = threads
++            options.inter_op_num_threads = 1
++            cv2.setNumThreads(1)
++        self.session = ort.InferenceSession(
++            model_path, sess_options=options, providers=preferred or available)
+         self.input_name = self.session.get_inputs()[0].name
+ 
+     def run(self, tensor: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+diff --git a/src/real_piper_perception/real_piper_perception/real_hold_place.py b/src/real_piper_perception/real_piper_perception/real_hold_place.py
+new file mode 100644
+index 0000000..0b2f2ef
+--- /dev/null
++++ b/src/real_piper_perception/real_piper_perception/real_hold_place.py
+@@ -0,0 +1,251 @@
++"""One opt-in PiPER cycle, with a separate command for returning the object."""
++from __future__ import annotations
++
++from dataclasses import dataclass
++from pathlib import Path
++import math
++import threading
++import time
++import uuid
++
++from .grasp_execute import (
++    END_EFFECTOR_LINK,
++    FEEDBACK_SETTLE_S,
++    GraspExecutor,
++    gripper_calibration_is_valid,
++)
++from .grasp_verify import OPEN_TOL, classify_grasp
++
++
++@dataclass
++class Preview:
++    id: str
++    candidate: str
++    expires_at: float
++    center_camera: tuple
++    pick_position_m: tuple
++    lift_height_m: float
++    pick: list
++    place: list
++
++
++class RealHoldPlace:
++    JOINT_TOL_RAD = 0.02
++    MAX_FRAME_AGE_S = 20.0
++    PREVIEW_TTL_S = 90.0
++
++    def __init__(self, executor: GraspExecutor, motion_enabled: bool, zero: list):
++        self.executor = executor
++        self.arm = executor.move_group
++        self.motion_enabled = motion_enabled
++        self.zero = dict(zip((f'joint{i}' for i in range(1, 7)), zero))
++        self.cancel = threading.Event()
++        self.preview: Preview | None = None
++        self.state = 'idle'
++        self.stage = ''
++        self.opening = None
++        self.released = False
++        self._reference: tuple[float, float] | None = None
++        self._held_width: float | None = None
++        self.arm.enable_hardware_feedback()
++
++    def status(self) -> dict:
++        preview = self.preview
++        remaining = preview.expires_at - time.monotonic() if preview else 0.0
++        state = 'expired' if self.state == 'prepared' and remaining <= 0 else self.state
++        return {
++            'success': True, 'state': state, 'stage': self.stage,
++            'preview_id': preview.id if preview else None,
++            'candidate': preview.candidate if preview else None,
++            'pick_position_m': preview.pick_position_m if preview else None,
++            'lift_height_m': preview.lift_height_m if preview else None,
++            'approval_remaining_s': round(max(0.0, remaining), 1) if state == 'prepared' else None,
++            'motion_enabled': self.motion_enabled,
++            'stop_requested': self.cancel.is_set(),
++            'opening_m': self.opening, 'released': self.released,
++        }
++
++    def check_frame(self, csv_path: str) -> int:
++        modified = Path(csv_path).stat().st_mtime_ns
++        if not 0 <= time.time() - modified / 1e9 <= self.MAX_FRAME_AGE_S:
++            raise RuntimeError('抓取候选已过期，请更新感知后再预演')
++        return modified
++
++    def _match(self, expected: dict, stage: str) -> None:
++        actual = self.arm.hardware_joints()
++        if any(abs(actual[name] - value) > self.JOINT_TOL_RAD
++               for name, value in expected.items()):
++            raise RuntimeError(f'{stage}：真机关节位置与预演不一致')
++
++    def _plan(self, start: dict, label: str, pose: dict | None = None,
++              *, cartesian: bool = False):
++        self.arm.set_planning_start(start)
++        if pose is None:
++            self.arm.set_joint_value_target(self.zero)
++            plan = self.arm.plan()
++        else:
++            link_pose = self.executor._make_pose_msg(self.executor._tcp_pose_to_link6(pose))
++            if cartesian:
++                plan, fraction = self.arm.compute_cartesian_path(
++                    [link_pose], eef_step=0.005, jump_threshold=1.5, avoid_collisions=True)
++                if not math.isfinite(fraction) or fraction < 1.0 - 1e-9:
++                    raise RuntimeError(f'{label}：笛卡尔路径不完整')
++            else:
++                self.arm.set_pose_target(link_pose, end_effector_link=END_EFFECTOR_LINK)
++                plan = self.arm.plan()
++        if plan is None:
++            raise RuntimeError(f'{label}：规划失败')
++        trajectory = plan.trajectory.joint_trajectory
++        names = list(trajectory.joint_names)
++        points = trajectory.points
++        if len(names) != len(start) or set(names) != set(start) or len(points) < 2:
++            raise RuntimeError(f'{label}：轨迹关节或点数异常')
++        previous = start
++        previous_time = -1.0
++        for point in points:
++            current = dict(zip(names, point.positions))
++            stamp = point.time_from_start.sec + point.time_from_start.nanosec * 1e-9
++            tolerance = self.JOINT_TOL_RAD if previous is start else 0.20
++            if (len(point.positions) != len(names) or stamp <= previous_time
++                    or not all(math.isfinite(value) for value in current.values())
++                    or any(abs(current[name] - previous[name]) > tolerance for name in names)):
++                raise RuntimeError(f'{label}：轨迹时间或关节连续性异常')
++            previous, previous_time = current, stamp
++        return (label, plan, dict(start), previous)
++
++    def prepare(self, candidate: str, poses: dict, center_camera) -> dict:
++        state = self.status()['state']
++        if state not in {'idle', 'placed', 'expired'}:
++            raise RuntimeError(f'当前状态 {state} 无法开始新预演')
++        self._match(self.zero, '预演起点')
++        start = self.arm.hardware_joints()
++        scale = float(self.executor.params['velocity_scale'])
++        if not 0 < scale <= 0.05:
++            raise RuntimeError('真机速度缩放必须在 0 至 0.05 之间')
++        self.arm.set_max_velocity_scaling_factor(scale)
++        self.arm.set_planning_time(float(self.executor.params['planning_time_exec']))
++        try:
++            grasp, lift = poses['grasp'], poses['lift']
++            # The lift and return follow the same vertical line. Release at
++            # the original supported grasp height before retreating.
++            clearance = lift['pos'][2] - grasp['pos'][2]
++            if not 0.02 <= clearance <= 0.06:
++                raise RuntimeError('抬升高度须为 20 至 60 mm')
++            approach = self._plan(start, 'approach', lift)
++            descend = self._plan(approach[3], 'grasp', grasp, cartesian=True)
++            raise_object = self._plan(descend[3], 'lift', lift, cartesian=True)
++            lower = self._plan(raise_object[3], 'lower', grasp, cartesian=True)
++            if any(abs(lower[3][name] - value) > self.JOINT_TOL_RAD
++                   for name, value in descend[3].items()):
++                raise RuntimeError('放回路径未返回原抓取关节位姿')
++            retreat = self._plan(lower[3], 'retreat', lift, cartesian=True)
++            home = self._plan(retreat[3], 'home')
++            if any(abs(home[3][name] - value) > self.JOINT_TOL_RAD
++                   for name, value in self.zero.items()):
++                raise RuntimeError('回零轨迹终点不符合零位')
++        finally:
++            self.arm.set_start_state_to_current_state()
++        self.preview = Preview(uuid.uuid4().hex, candidate,
++                               time.monotonic() + self.PREVIEW_TTL_S,
++                               tuple(float(value) for value in center_camera),
++                               tuple(grasp['pos']), clearance,
++                               [approach, descend, raise_object], [lower, retreat, home])
++        self.state, self.stage, self.released = 'prepared', 'planned', False
++        self.opening = self._reference = self._held_width = None
++        return self.status()
++
++    def _check_cancel(self) -> None:
++        if self.cancel.is_set():
++            raise RuntimeError('已请求停止')
++
++    def _move(self, segment) -> None:
++        self.stage, plan, start, end = segment
++        self._check_cancel()
++        self._match(start, self.stage)
++        if not self.arm.execute(plan, cancel_event=self.cancel):
++            raise RuntimeError(f'{self.stage}：轨迹未完成')
++        self._check_cancel()
++        deadline = time.monotonic() + 1.0
++        while True:
++            self._check_cancel()
++            try:
++                self._match(end, self.stage)
++                break
++            except RuntimeError:
++                if time.monotonic() >= deadline:
++                    raise
++                time.sleep(0.05)
++
++    def _gripper(self, target: float, label: str) -> float:
++        self._check_cancel()
++        self.arm.hardware_joints()
++        if not self.executor._gripper_set_width(target, label):
++            raise RuntimeError(f'{label}夹爪命令失败')
++        self._check_cancel()
++        time.sleep(FEEDBACK_SETTLE_S)
++        return self._read_opening()
++
++    def _read_opening(self) -> float:
++        opening = self.executor._read_gripper_feedback_stable()
++        self._check_cancel()
++        self.arm.hardware_joints()
++        if opening is None or not 0 <= opening <= 0.075:
++            raise RuntimeError('未收到有效、稳定的夹爪反馈')
++        self.opening = opening
++        return opening
++
++    def _verify_hold(self, opening: float) -> None:
++        if classify_grasp(opening, *self._reference)[0] != 'success':
++            raise RuntimeError('夹爪开度未通过持物复核')
++        if self._held_width is not None and abs(opening - self._held_width) > 0.003:
++            raise RuntimeError('夹爪开度变化超过持物容差')
++
++    def _ready(self, expected: str) -> Preview:
++        if not self.motion_enabled:
++            raise RuntimeError('当前仅允许预演，真机动作尚未启用')
++        if self.status()['state'] != expected or self.preview is None:
++            raise RuntimeError(f'当前状态不能执行此命令，需要 {expected}')
++        return self.preview
++
++    def pick(self) -> dict:
++        preview = self._ready('prepared')
++        self._check_cancel()
++        self._match(preview.pick[0][2], '抓取起点')
++        self.state, self.stage = 'picking', 'gripper_calibration'
++        full_open = self._gripper(0.07, '标定张开')
++        if not 0.060 <= full_open <= 0.075:
++            raise RuntimeError('夹爪全开反馈无效')
++        full_closed = self._gripper(0.0, '标定闭合')
++        if not gripper_calibration_is_valid(full_open, full_closed):
++            raise RuntimeError('全开及全闭参考无效')
++        self._reference = full_open, full_closed
++        if self._gripper(0.07, '预抓张开') < full_open - OPEN_TOL:
++            raise RuntimeError('预抓张开未到位')
++        self._move(preview.pick[0])
++        self._move(preview.pick[1])
++        self.stage = 'closing'
++        self._match(preview.pick[1][3], self.stage)
++        self._held_width = self._gripper(0.0, '抓取闭合')
++        self._verify_hold(self._held_width)
++        self._move(preview.pick[2])
++        self.stage = 'hold_feedback'
++        self._verify_hold(self._read_opening())
++        self.state = 'held'
++        return self.status()
++
++    def place(self) -> dict:
++        preview = self._ready('held')
++        self._check_cancel()
++        self.state, self.stage = 'placing', 'hold_feedback'
++        self._verify_hold(self._read_opening())
++        self._move(preview.place[0])
++        self.stage = 'release'
++        self._verify_hold(self._read_opening())
++        self._match(preview.place[0][3], self.stage)
++        if self._gripper(0.07, '放置张开') < self._reference[0] - OPEN_TOL:
++            raise RuntimeError('释放开度未到位')
++        self.released = True
++        for segment in preview.place[1:]:
++            self._move(segment)
++        self.state, self.stage = 'placed', 'home'
++        return self.status()
+diff --git a/src/real_piper_perception/test/test_real_hold_place.py b/src/real_piper_perception/test/test_real_hold_place.py
+new file mode 100644
+index 0000000..7b5cf0d
+--- /dev/null
++++ b/src/real_piper_perception/test/test_real_hold_place.py
+@@ -0,0 +1,86 @@
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++
++from real_piper_perception.real_hold_place import RealHoldPlace
++
++
++def make_cycle(monkeypatch, openings, motion=True):
++    monkeypatch.setattr('real_piper_perception.real_hold_place.FEEDBACK_SETTLE_S', 0)
++    gripper = Mock()
++    gripper.params = {'velocity_scale': 0.02, 'planning_time_exec': 1.0}
++    gripper._read_gripper_feedback_stable.side_effect = openings
++    arm = gripper.move_group
++    arm.hardware_joints.return_value = {f'joint{i}': 0.0 for i in range(1, 7)}
++    planned_start = {}
++
++    def set_start(joints):
++        planned_start.update(joints)
++
++    def plan():
++        pos = list(planned_start.values())
++        points = [
++            SimpleNamespace(positions=pos, time_from_start=SimpleNamespace(sec=sec, nanosec=0))
++            for sec in (0, 1)
++        ]
++        trajectory = SimpleNamespace(joint_names=list(planned_start), points=points)
++        return SimpleNamespace(trajectory=SimpleNamespace(joint_trajectory=trajectory))
++
++    arm.set_planning_start.side_effect = set_start
++    arm.plan.side_effect = plan
++    arm.compute_cartesian_path.side_effect = lambda *args, **kwargs: (plan(), 1.0)
++    cycle = RealHoldPlace(gripper, motion, [0.0] * 6)
++    cycle.prepare('block_0', {
++        'grasp': {'pos': [0.3, 0.0, 0.04]},
++        'lift': {'pos': [0.3, 0.0, 0.09]},
++    }, [0.3, 0.0, 0.04])
++    return cycle, arm, gripper
++
++
++def test_pick_holds_until_a_separate_place_request(monkeypatch):
++    cycle, arm, gripper = make_cycle(
++        monkeypatch, [0.07, 0.004, 0.07, 0.04, 0.04, 0.04, 0.04, 0.07])
++    arm.execute.assert_not_called()
++    gripper._gripper_set_width.assert_not_called()
++
++    assert cycle.pick()['state'] == 'held'
++    assert arm.execute.call_count == 3
++    assert gripper._gripper_set_width.call_args.args[0] == 0.0
++    with pytest.raises(RuntimeError, match='prepared'):
++        cycle.pick()
++
++    result = cycle.place()
++    assert result['state'] == 'placed' and result['released']
++    assert arm.execute.call_count == 6
++    assert gripper._gripper_set_width.call_args.args[0] == 0.07
++
++
++def test_zero_feedback_and_disabled_motion_cannot_move_the_arm(monkeypatch):
++    cycle, arm, gripper = make_cycle(monkeypatch, [], motion=False)
++    with pytest.raises(RuntimeError, match='尚未启用'):
++        cycle.pick()
++    gripper._gripper_set_width.assert_not_called()
++    arm.execute.assert_not_called()
++
++    cycle, arm, gripper = make_cycle(monkeypatch, [0.0])
++    with pytest.raises(RuntimeError, match='全开反馈无效'):
++        cycle.pick()
++    arm.execute.assert_not_called()
++    assert gripper._gripper_set_width.call_count == 1
++
++
++def test_cancel_during_lowering_cannot_open_the_gripper(monkeypatch):
++    cycle, arm, gripper = make_cycle(
++        monkeypatch, [0.07, 0.004, 0.07, 0.04, 0.04, 0.04])
++    assert cycle.pick()['state'] == 'held'
++
++    def stop(plan, cancel_event):
++        cancel_event.set()
++        return False
++
++    arm.execute.side_effect = stop
++    with pytest.raises(RuntimeError, match='lower'):
++        cycle.place()
++    assert not cycle.released
++    assert gripper._gripper_set_width.call_args.args[0] == 0.0

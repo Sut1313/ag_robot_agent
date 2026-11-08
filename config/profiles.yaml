@@ -1,0 +1,52 @@
+# Tool registration by profile.
+# A profile includes every group listed for it. Tools not registered are
+# invisible to the LLM (stronger than prompt-level instructions).
+groups:
+  read:
+    - session_status
+    - precheck_all
+    - perception_detections
+    - grasp_candidates
+    - grasp_result_latest
+    - read_joint_states
+    - module_logs_tail
+    - audit_tail
+
+  operate:
+    - perception_start
+    - perception_stop
+    - perception_view_open
+    - perception_view_close
+    - graspnet_start
+    - graspnet_stop
+    - moveit_start
+    - moveit_stop
+    - rviz_open
+    - rviz_close
+
+  yolo:
+    - yolo_pick
+    - yolo_pick_status
+
+  tabletop:
+    - tabletop_pick
+    - tabletop_pick_status
+    - tabletop_stop
+
+  grasp:
+    - executor_start
+    - grasp_precheck
+    - grasp_execute
+    - real_hold_prepare
+    - grasp_and_hold
+    - held_object_status
+    - place_held_object
+    - grasp_job_status
+    - grasp_cancel
+    - estop
+    - recover
+
+profiles:
+  read: [read]
+  operate: [read, operate]
+  grasp: [read, operate, grasp, yolo, tabletop]

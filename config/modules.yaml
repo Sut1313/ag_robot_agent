@@ -1,0 +1,52 @@
+# Module launch definitions used by tools/modules.py.
+# Scripts source their own ROS/workspace environments so the agent process
+# does not need those workspaces on its own path.
+
+perception:
+  script_sim: ${AGENT_ROOT}/scripts/start_perception_sim.sh
+  script_real: ${AGENT_ROOT}/scripts/start_perception_real.sh
+  ready_file: detections.json
+  ready_timeout_s: 40
+  default_target_class: block
+  default_target_class_sim: wood_block
+
+perception_view:
+  script: ${AGENT_ROOT}/scripts/viewer_yolo.py
+  ready_timeout_s: 5
+
+graspnet:
+  script: ${AGENT_ROOT}/scripts/start_graspnet.sh
+  ready_file: perception_grasps.csv
+  ready_timeout_s: 120
+
+moveit:
+  sim_script: ${AGENT_ROOT}/scripts/start_moveit_sim.sh
+  real_script: ${AGENT_ROOT}/scripts/start_moveit_real.sh
+  ready_node: move_group
+  ready_timeout_s: 30
+  settle_s: 15
+
+grasp_executor:
+  script_dry: ${AGENT_ROOT}/scripts/start_grasp_executor_dry.sh
+  script_real: ${AGENT_ROOT}/scripts/start_grasp_executor_real.sh
+  service_dry: /grasp_execute_dry
+  service_real: /grasp_execute_real
+  ready_timeout_s: 45
+  handeye_sim: ${AGENT_ROOT}/config/handeye_sim.yaml
+  handeye_real: ${PIPER_REAL_WS}/camera_data/handeye_eye_to_hand.yaml
+  velocity_scale: 0.02
+  open_gripper_lift_height: 0.05
+  lift_z: 0.05
+  real_hold_place: true
+  # Match the 2026-10-22 test setting. Verify against the current table before motion.
+  real_grasp_z_offset_m: 0.0
+  # Switch to true for an attended test after checking hardware feedback and dry planning.
+  real_hold_place_motion: false
+
+feedback_bridge:
+  script: ${AGENT_ROOT}/scripts/joint_feedback_bridge.py
+
+rviz:
+  sim_script: ${AGENT_ROOT}/scripts/start_rviz_sim.sh
+  real_script: ${AGENT_ROOT}/scripts/start_rviz_real.sh
+  ready_timeout_s: 15

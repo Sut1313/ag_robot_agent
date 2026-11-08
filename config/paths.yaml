@@ -1,0 +1,6 @@
+paths:
+  shared_dir: ${PIPER_REAL_WS}/shared_camera_data
+  sim_shared_dir: ${AGENT_ROOT}/runtime_data/tabletop_67
+  real_ws: ${PIPER_REAL_WS}
+  sim_ws: ${PIPER_TABLETOP_WS}
+  logs_dir: ${AGENT_ROOT}/logs

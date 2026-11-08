@@ -1,0 +1,23 @@
+joint_states_topic: /joint_states
+camera_topic: /camera/camera/color/image_raw
+detections_topic: /real_piper_yolo/detections
+moveit_node: move_group
+moveit_service: /get_planning_scene
+arm_controller: arm_controller
+gripper_controller: gripper_controller
+
+tf:
+  sim:
+    parent: base_frame_link
+    child: camera_link
+  real:
+    parent: base_link
+    child: camera_link
+
+files:
+  detections: detections.json
+  grasps: perception_grasps.csv
+  grasp_result: grasp_result.json
+  overlay: yolo_overlay.png
+
+perception_fresh_s: 10

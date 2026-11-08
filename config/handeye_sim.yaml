@@ -1,0 +1,20 @@
+# Eye-to-hand calibration for piper_tabletop_sim, expressed in MoveIt's
+# planning frame (base_link), derived from the TF chain:
+#   base_link <- base_frame_link <- camera_color_optical_frame
+# This matches the workspace handeye_sim.yaml (t_z ~= 0.659); the earlier
+# base_frame_link-relative variant was the wrong frame for MoveIt.
+R_cam2base:
+  - [0.0, -0.8660254, 0.5]
+  - [-1.0, 0.0, 0.0]
+  - [0.0, -0.5, -0.8660254]
+t_cam2base: [-0.037194, -0.181287, 0.659065]
+T_cam2base:
+  - [0.0, -0.8660254, 0.5, -0.037194]
+  - [-1.0, 0.0, 0.0, -0.181287]
+  - [0.0, -0.5, -0.8660254, 0.659065]
+  - [0.0, 0.0, 0.0, 1.0]
+parent_frame: base_link
+child_frame: camera_color_optical_frame
+description: >
+  Derived from the live Gazebo TF chain and expressed in MoveIt's planning
+  frame base_link. Cube (4 cm) centre is at base_link (0.291, -0.108, -0.2775).
